@@ -2,7 +2,7 @@ pub mod pregen;
 
 use clap::{Parser, Subcommand};
 use pregen::Pregen;
-use rcon::{Connection, Error};
+use rcon::Connection;
 use tokio::net::TcpStream;
 
 #[derive(Parser, Debug)]
@@ -45,6 +45,6 @@ async fn main() -> anyhow::Result<()> {
 
     match args.commands {
         Commands::Pregen(command) => pregen::execute(command, conn).await,
-        Interactive => todo!(),
+        _ => todo!(),
     }
 }
