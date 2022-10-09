@@ -1,7 +1,9 @@
-use std::{cmp::Ordering, path::Path, time::Duration};
+use std::{cmp::Ordering, collections::HashSet, path::Path, time::Duration};
 
-use anyhow::Context;
+use anyhow::bail;
+use cgmath::Point2;
 use clap::{Args, ValueEnum};
+use linestring::linestring_2d::{convex_hull::ConvexHull, LineString2};
 use rcon::Connection;
 use tokio::net::TcpStream;
 
@@ -99,27 +101,28 @@ impl Chunks {
     }
 
     /// x and z are already recentered compared to the map
-    pub(crate) fn fill_stride(&mut self, x: usize, z: usize, sx: u8, sz: u8) -> anyhow::Result<()> {
-        let x0 = x - (sx as usize);
-        let x1 = x + (sx as usize) - 1;
-
-        let z0 = z - (sz as usize);
-        let z1 = z + (sz as usize) - 1;
-
-        for j in z0..z1 {
-            let row = self
-                .chunks
-                .get_mut(j)
-                .context(format!("Can't get row {j}"))?;
-
-            for i in x0..x1 {
-                let cell = row
-                    .get_mut(i)
-                    .context(format!("Can't get cell at address ({i}, {j})"))?;
-
-                *cell = true;
+    pub(crate) fn fill_stride(
+        &mut self,
+        x: usize,
+        z: usize,
+        base_points: &[(isize, isize)],
+    ) -> anyhow::Result<()> {
+        for (i, j) in base_points {
+            if let Some(row) = self.chunks.get_mut(*j as usize + z) {
+                if let Some(cell) = row.get_mut(*i as usize + x) {
+                    *cell = true;
+                } else {
+                    eprintln!(
+                        "Couldn't find cell ({}, {})",
+                        *i as usize + x,
+                        *j as usize + z
+                    )
+                }
+            } else {
+                eprintln!("Couldn't find row {}", *j as usize + z)
             }
         }
+
         Ok(())
     }
 
@@ -130,20 +133,58 @@ impl Chunks {
         sx: u8,
         sz: u8,
     ) -> Vec<(isize, isize)> {
-        ((sz as usize - 1)..(self.z_size - sz as usize + 1))
-            .step_by(sz as usize - 1)
-            .map(|j| {
-                let z = ((j as isize - offset_z) * CHUNK_SIZE) + (CHUNK_SIZE / 2);
+        let horizontal_step = sx as isize;
+        let vertical_step = sz as isize;
 
-                ((sx as usize - 1)..(self.x_size - sx as usize + 1))
-                    .step_by(sx as usize - 1)
-                    .map(|i| {
-                        let x = ((i as isize - offset_x) * CHUNK_SIZE) + (CHUNK_SIZE / 2);
-                        (x, z)
-                    })
-                    .collect::<Vec<(isize, isize)>>()
+        let initial_teleport_point = (
+            (horizontal_step / 2) - (offset_x),
+            (vertical_step / 2) - (offset_z),
+        );
+
+        let mut first_row = vec![initial_teleport_point.clone()];
+        let mut last_point = first_row.last().unwrap().clone();
+
+        while last_point.1 <= (self.z_size as isize - offset_z) - vertical_step - 1 {
+            first_row.push((last_point.0, last_point.1 + vertical_step));
+            last_point = first_row.last().unwrap().clone();
+        }
+
+        let mut inter_points = vec![];
+        let mut all_rows = vec![first_row];
+
+        while last_point.0 <= (self.x_size as isize - offset_x) - horizontal_step - 1 {
+            let last_row = all_rows.last().unwrap();
+            let new_row = last_row
+                .iter()
+                .map(|(x, z)| (x + horizontal_step, *z))
+                .collect::<Vec<_>>();
+
+            let points = last_row
+                .windows(2)
+                .zip(new_row.windows(2))
+                .map(|(previous, new)| {
+                    let tl = previous[0];
+                    let br = new[1];
+                    find_centroid(tl, br)
+                });
+
+            inter_points.extend(points);
+            last_point = new_row.last().unwrap().clone();
+            all_rows.push(new_row);
+        }
+
+        let mut points = all_rows.into_iter().flatten().collect::<Vec<_>>();
+
+        points.extend(inter_points);
+
+        let points = points.into_iter().collect::<HashSet<_>>();
+
+        points
+            .into_iter()
+            .filter(|(x, z)| {
+                self.chunks[*x as usize + offset_x as usize][*z as usize + offset_z as usize]
+                    == false
             })
-            .flatten()
             .collect()
     }
 
@@ -152,6 +193,11 @@ impl Chunks {
         std::fs::write(path, data)?;
         Ok(())
     }
+}
+
+/// Given two extreme points, give the centroid
+fn find_centroid(tl: (isize, isize), br: (isize, isize)) -> (isize, isize) {
+    ((br.0 + tl.0) / 2, (br.1 + tl.1) / 2)
 }
 
 pub(crate) async fn execute(
@@ -200,10 +246,12 @@ pub(crate) async fn execute(
     match command.mode {
         Mode::Expanding => {
             points.sort_by(|a, b| {
-                let distance_a =
-                    ((a.0 - center_x).pow(2) as f64 + (a.1 - center_z).pow(2) as f64).sqrt();
-                let distance_b =
-                    ((b.0 - center_x).pow(2) as f64 + (b.1 - center_z).pow(2) as f64).sqrt();
+                let distance_a = ((a.0 - chunked_center_x).pow(2) as f64
+                    + (a.1 - chunked_center_z).pow(2) as f64)
+                    .sqrt();
+                let distance_b = ((b.0 - chunked_center_x).pow(2) as f64
+                    + (b.1 - chunked_center_z).pow(2) as f64)
+                    .sqrt();
 
                 match distance_a.total_cmp(&distance_b) {
                     o @ Ordering::Less => o,
@@ -221,35 +269,95 @@ pub(crate) async fn execute(
         }
     }
 
+    let base_convex_hull = generate_convex_hull(command.sx as usize);
+    let hull_points = generate_list_of_points(&base_convex_hull, command.sx as isize);
+
     for (x, z) in points {
+        let real_x = x * CHUNK_SIZE + 8;
+        let real_z = z * CHUNK_SIZE + 8;
         let cmd = format!(
-            "cofh tpx {} {x} 320 {z} {}",
+            "cofh tpx {} {real_x} 320 {real_z} {}",
             command.player_name, command.dimension_id
         );
         println!("Sending: {cmd}");
         let result = conn.cmd(&cmd).await?;
+
+        if result.starts_with("That player cannot") {
+            bail!("Couldn't find player on server")
+        }
+
         println!("Server: {result}");
 
-        let chunked_x = if x < 0 {
-            (x / CHUNK_SIZE) - 1
-        } else {
-            x / CHUNK_SIZE
-        };
+        let chunked_x = if x < 0 { x - 1 } else { x };
 
-        let chunked_z = if x < 0 {
-            (z / CHUNK_SIZE) - 1
-        } else {
-            z / CHUNK_SIZE
-        };
+        let chunked_z = if x < 0 { z - 1 } else { z };
 
         let chunked_x = (chunked_x + offset_x) as usize;
         let chunked_z = (chunked_z + offset_z) as usize;
 
-        chunks.fill_stride(chunked_x, chunked_z, command.sx, command.sz)?;
+        chunks.fill_stride(chunked_x, chunked_z, &hull_points)?;
         chunks.save_chunks("./chunks.json").await?;
 
         tokio::time::sleep(Duration::from_secs(command.wait)).await;
     }
 
     Ok(())
+}
+
+fn generate_convex_hull(stride: usize) -> LineString2<f64> {
+    use line_drawing::BresenhamCircle;
+
+    let circle = BresenhamCircle::new(0, 0, stride as isize - 1);
+
+    let points = circle
+        .map(|(x, y)| Point2::new(x as f64, y as f64))
+        .collect::<Vec<_>>();
+
+    let (left, right): (Vec<Point2<f64>>, Vec<Point2<f64>>) =
+        points.into_iter().partition(|p| p.x < 0.0);
+
+    let (mut tl, mut bl): (Vec<Point2<f64>>, Vec<Point2<f64>>) =
+        left.into_iter().partition(|p| p.y > 0.0);
+
+    let (mut tr, mut br): (Vec<Point2<f64>>, Vec<Point2<f64>>) =
+        right.into_iter().partition(|p| p.y > 0.0);
+
+    tl.sort_by(|a, b| a.x.total_cmp(&b.x).then_with(|| a.y.total_cmp(&b.y)));
+    bl.sort_by(|a, b| {
+        a.x.total_cmp(&b.x)
+            .reverse()
+            .then_with(|| a.y.total_cmp(&b.y))
+    });
+    tr.sort_by(|a, b| {
+        a.x.total_cmp(&b.x)
+            .then_with(|| a.y.total_cmp(&b.y).reverse())
+    });
+    br.sort_by(|a, b| {
+        a.x.total_cmp(&b.x)
+            .reverse()
+            .then_with(|| a.y.total_cmp(&b.y).reverse())
+    });
+
+    let mut points = vec![];
+
+    points.extend(tr);
+    points.extend(br);
+    points.extend(bl);
+    points.extend(tl);
+
+    ConvexHull::graham_scan(&points)
+}
+
+fn generate_list_of_points(hull: &LineString2<f64>, stride: isize) -> Vec<(isize, isize)> {
+    let mut points = vec![];
+
+    for j in -(stride - 1)..=(stride - 1) {
+        for i in -(stride - 1)..=(stride - 1) {
+            if ConvexHull::contains_point_inclusive(hull, [i as f64, j as f64].into()) {
+                points.push((i, j));
+            }
+        }
+    }
+
+    points
 }
