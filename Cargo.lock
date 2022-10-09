@@ -230,6 +230,15 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "329c933548736bc49fd575ee68c89e8be4d260064184389a5b77517cddd99ffb"
 
 [[package]]
+name = "line_drawing"
+version = "1.0.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "3d1478a313008a3e6c8149995e90a99ee9094034b5c5c3da1eeb81183cb61d1d"
+dependencies = [
+ "num-traits",
+]
+
+[[package]]
 name = "linestring"
 version = "0.8.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -445,6 +454,7 @@ dependencies = [
  "anyhow",
  "cgmath",
  "clap",
+ "line_drawing",
  "linestring",
  "rcon",
  "serde",
